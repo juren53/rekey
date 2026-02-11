@@ -1,0 +1,29 @@
+                                                                                                                                                           
+v0.0.1 Status
+
+Here's where things stand :                                                                                                                                  
+                                                                                                                                                            
+  What works:                                                                                                                                                 
+  - The full GUI (window, capture dialogs, character input, table, tray icon, settings)                                                                       
+  - Storage/persistence (mappings survive restarts)                                                                                                           
+  - Key grabbing (XGrabKey succeeds, keys are suppressed from other apps)                                                                                     
+  - Key simulation via XTEST (the _resolve_keysym correctly maps @ → Shift+2, etc.)
+  - The entire pipeline works in isolated tests (grab F3 → callback fires → simulate @ → correct output)
+
+  The blocking problem:
+  - The event loop doesn't work in the running app. Grabbed keys are suppressed but the replacement key is never simulated.
+  - Root cause: python-xlib's Display object is not thread-safe. When the main thread calls evt_display.sync() (during grab_key) while the event thread is
+  blocking on evt_display.next_event(), they corrupt each other's socket reads.
+  - We also discovered that QSocketNotifier and select() on the Xlib fd are unreliable — python-xlib's sync() drains socket data into internal buffers, so
+  select() never sees it as readable. Only blocking next_event() works.
+
+  The fix needed:
+  - All X11 operations (grabs, ungrabs, simulate, event reading) must happen on a single display connection from a single thread.
+  - The main thread should send commands (grab/ungrab/simulate) to the event thread via a queue.Queue.
+  - A wakeup mechanism (e.g. a fake XTEST keypress from a second connection) is needed to unblock next_event() so the event thread can process queued
+  commands.
+  - The event thread emits a Qt signal back to the main thread when a grabbed key is pressed (this part already works).
+
+  In short: the architecture is 95% there. The remaining fix is making the event thread the sole owner of the X display, with command queuing from the main
+  thread.
+
