@@ -23,7 +23,7 @@ from gui.system_tray import SystemTrayManager
 
 def main():
     logging.basicConfig(
-        level=logging.DEBUG,
+        level=logging.INFO,
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     )
     log = logging.getLogger("rekey")

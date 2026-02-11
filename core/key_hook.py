@@ -1,267 +1,341 @@
 """
-X11 global key grab and XTEST key simulation.
+Key interception via evdev + key simulation via XTEST.
 
-Uses a background thread with blocking next_event() to receive X events,
-then dispatches to the Qt main thread via signals.
+Architecture:
+- A background thread reads raw key events from /dev/input/event* via evdev.
+- Grabbed (mapped) keys are suppressed at the evdev level — they never reach
+  the X server or compositor.
+- Non-grabbed keys are forwarded transparently via a uinput virtual keyboard.
+- Replacement keys are simulated via XTEST on an X11 Display connection
+  (owned exclusively by the event thread).
+- Event thread → Qt main thread communication via pyqtSignal.
+- Main thread → event thread communication via queue.Queue.
+
+This approach works on all Linux desktops (X11, Xwayland compositors like
+Mutter/Muffin/KWin) because evdev operates below the compositor layer.
 """
 
 import logging
+import queue
 import threading
 
+import evdev
+from evdev import InputDevice, UInput, categorize, ecodes
+
 from PyQt5.QtCore import QObject, pyqtSignal
-from Xlib import X, XK, display, error
+from Xlib import X, XK, display
 from Xlib.ext import xtest
 
 log = logging.getLogger(__name__)
 
-# Lock masks to iterate for NumLock/CapsLock-insensitive grabs
-_LOCK_MASK = X.LockMask      # CapsLock
-_NUM_LOCK_MASK = X.Mod2Mask   # NumLock (typical)
-_IGNORE_MASKS = [
-    0,
-    _LOCK_MASK,
-    _NUM_LOCK_MASK,
-    _LOCK_MASK | _NUM_LOCK_MASK,
-]
+
+def _find_keyboards():
+    """Return list of evdev paths for real keyboard devices."""
+    keyboards = []
+    for path in evdev.list_devices():
+        try:
+            dev = InputDevice(path)
+            caps = dev.capabilities().get(ecodes.EV_KEY, [])
+            if ecodes.KEY_A in caps:
+                keyboards.append(path)
+        except (OSError, PermissionError):
+            pass
+    return keyboards
+
+
+# Mapping from evdev key codes to X11 keysyms for common keys.
+# Evdev KEY_* → X11 keysym.  We build this from Xlib at runtime
+# using the X display's keyboard mapping, but we need a static
+# table for keys that don't have a 1:1 keycode correspondence.
+_EVDEV_TO_KEYSYM = {}
+
+def _build_evdev_keysym_table(dpy):
+    """Build evdev-keycode → X11-keysym mapping using the X display."""
+    # X11 keycodes = evdev keycodes + 8
+    min_kc = dpy.display.info.min_keycode
+    max_kc = dpy.display.info.max_keycode
+    mapping = dpy.get_keyboard_mapping(min_kc, max_kc - min_kc + 1)
+    table = {}
+    for i, keysyms in enumerate(mapping):
+        x_keycode = min_kc + i
+        evdev_keycode = x_keycode - 8
+        if keysyms and keysyms[0] != 0:
+            table[evdev_keycode] = keysyms[0]  # unshifted keysym
+    return table
 
 
 class X11KeyHook(QObject):
-    """Grabs keys globally via X11 and simulates replacements with XTEST."""
+    """Intercepts keys via evdev, simulates replacements via XTEST."""
 
-    key_intercepted = pyqtSignal(int, int)  # keysym, modifiers
+    key_intercepted = pyqtSignal(int, int)
     hook_error = pyqtSignal(str)
-    # Internal signal: event thread → main thread
-    _key_event = pyqtSignal(int, int)  # keycode, clean_mods
+    _key_event = pyqtSignal(int, int)  # evdev_keycode, 0 (mods not used yet)
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._display = None       # main thread: grabs + simulate
-        self._evt_display = None   # event thread: blocking next_event()
-        self._root = None
-        self._grabbed = {}  # (keycode, clean_mods) → callback(keysym, mods)
+        self._grabbed = {}        # evdev_keycode → callback
+        self._grabbed_with_mods = {}  # (evdev_keycode, x11_mods) → callback
+        self._keysym_to_evdev = {}  # x11_keysym → evdev_keycode
+        self._evdev_to_keysym = {}
         self._running = False
         self._thread = None
+        self._cmd_q = queue.Queue()
+        self._result_q = queue.Queue()
         self._key_event.connect(self._on_key_event)
 
     def start(self):
-        """Open X display and start listening for grabbed key events."""
         if self._running:
             return
-        try:
-            self._display = display.Display()
-            self._root = self._display.screen().root
-            if not self._display.has_extension("XTEST"):
-                self.hook_error.emit("XTEST extension not available")
-                return
-            # Second connection for blocking event reads
-            self._evt_display = display.Display()
-            self._evt_root = self._evt_display.screen().root
-            self._evt_root.change_attributes(event_mask=X.KeyPressMask)
-        except Exception as e:
-            self.hook_error.emit(f"Cannot open X display: {e}")
+
+        keyboards = _find_keyboards()
+        if not keyboards:
+            self.hook_error.emit("No keyboard devices found in /dev/input/")
             return
 
         self._running = True
-        self._thread = threading.Thread(target=self._event_loop, daemon=True)
+        self._thread = threading.Thread(
+            target=self._event_loop, args=(keyboards,), daemon=True
+        )
         self._thread.start()
-        log.info("X11KeyHook started on display %s", self._display.get_display_name())
+
+        # Wait for init
+        try:
+            ok = self._result_q.get(timeout=5)
+        except queue.Empty:
+            ok = False
+        if not ok:
+            self._running = False
+            self.hook_error.emit("Event thread failed to start")
 
     def stop(self):
-        """Stop listening and ungrab all keys."""
         if not self._running:
             return
         self._running = False
-        # Ungrab everything (on main display)
-        for keycode, clean_mods in list(self._grabbed.keys()):
-            self._ungrab_raw(keycode, clean_mods)
+        if self._thread:
+            self._thread.join(timeout=2)
+            self._thread = None
         self._grabbed.clear()
-        if self._display:
-            self._display.close()
-            self._display = None
-        if self._evt_display:
-            self._evt_display.close()
-            self._evt_display = None
-        self._thread = None
+        self._grabbed_with_mods.clear()
         log.info("X11KeyHook stopped")
 
     def cleanup(self):
-        """Alias for stop(), suitable for app.aboutToQuit."""
         self.stop()
 
     def grab_key(self, keysym, modifiers, callback):
-        """
-        Grab a key globally. Returns True on success, False on conflict.
-
-        callback: callable(keysym, modifiers) invoked when the key is pressed.
-        """
-        if not self._display:
+        """Grab a key. Returns True on success."""
+        if not self._running:
             self.hook_error.emit("Hook not started")
             return False
 
-        keycode = self._display.keysym_to_keycode(keysym)
-        if keycode == 0:
-            self.hook_error.emit(f"No keycode for keysym 0x{keysym:04x}")
+        ev_kc = self._keysym_to_evdev.get(keysym)
+        if ev_kc is None:
+            self.hook_error.emit(f"No evdev keycode for keysym 0x{keysym:04x}")
             return False
 
-        clean_mods = modifiers & ~(_LOCK_MASK | _NUM_LOCK_MASK)
-        key = (keycode, clean_mods)
-        if key in self._grabbed:
+        if ev_kc in self._grabbed:
             return False
 
-        old_handler = error.CatchError(error.BadAccess)
-
-        # Grab only on the event display (the one that reads events)
-        for extra in _IGNORE_MASKS:
-            self._evt_root.grab_key(
-                keycode,
-                clean_mods | extra,
-                False,  # owner_events=False: all events to grab window
-                X.GrabModeAsync,
-                X.GrabModeAsync,
-                onerror=old_handler,
-            )
-        self._evt_display.sync()
-
-        if old_handler.get_error():
-            for extra in _IGNORE_MASKS:
-                self._evt_root.ungrab_key(keycode, clean_mods | extra)
-            self._evt_display.sync()
-            self.hook_error.emit(
-                "Key already grabbed by another application"
-            )
-            return False
-
-        self._grabbed[key] = callback
-        log.info("Grabbed keycode=%d mods=0x%x", keycode, clean_mods)
+        self._grabbed[ev_kc] = callback
+        log.info("Grabbed evdev keycode=%d (keysym=0x%x)", ev_kc, keysym)
         return True
 
     def ungrab_key(self, keysym, modifiers):
         """Ungrab a previously grabbed key."""
-        if not self._display:
+        ev_kc = self._keysym_to_evdev.get(keysym)
+        if ev_kc is None:
             return
-
-        keycode = self._display.keysym_to_keycode(keysym)
-        clean_mods = modifiers & ~(_LOCK_MASK | _NUM_LOCK_MASK)
-        key = (keycode, clean_mods)
-
-        if key not in self._grabbed:
-            return
-
-        self._ungrab_raw(keycode, clean_mods)
-        del self._grabbed[key]
-        log.info("Ungrabbed keycode=%d mods=0x%x", keycode, clean_mods)
-
-    def _ungrab_raw(self, keycode, clean_mods):
-        """Send ungrab requests for all lock-mask variants."""
-        if self._evt_display is None:
-            return
-        for extra in _IGNORE_MASKS:
-            self._evt_root.ungrab_key(keycode, clean_mods | extra)
-        self._evt_display.sync()
+        self._grabbed.pop(ev_kc, None)
+        log.info("Ungrabbed evdev keycode=%d", ev_kc)
 
     def simulate_key(self, keysym, modifiers):
-        """Simulate a key press+release using XTEST, including modifier keys.
+        """Queue a key simulation (fire-and-forget)."""
+        if not self._running:
+            return
+        self._cmd_q.put(('simulate', keysym, modifiers))
 
-        Scans the keyboard mapping to find which keycode + shift state
-        produces the requested keysym, so characters like '@' (Shift+2)
-        are handled automatically.
-        """
-        if not self._display:
+    # ── event thread ─────────────────────────────────────────────
+
+    def _event_loop(self, keyboard_paths):
+        """Runs in dedicated thread. Owns evdev devices + X display."""
+        # Open X display for XTEST simulation
+        try:
+            dpy = display.Display()
+            if not dpy.has_extension("XTEST"):
+                self._result_q.put(False)
+                return
+        except Exception:
+            log.exception("Cannot open X display")
+            self._result_q.put(False)
             return
 
-        keycode, extra_mods = self._resolve_keysym(keysym)
-        log.debug("simulate_key: keysym=0x%x -> keycode=%s extra_mods=0x%x",
-                  keysym, keycode, extra_mods)
+        # Build keysym ↔ evdev keycode tables
+        self._evdev_to_keysym = _build_evdev_keysym_table(dpy)
+        self._keysym_to_evdev = {v: k for k, v in self._evdev_to_keysym.items()}
+
+        # Open keyboard devices and grab them
+        devices = []
+        for path in keyboard_paths:
+            try:
+                dev = InputDevice(path)
+                dev.grab()  # exclusive access
+                devices.append(dev)
+                log.info("Grabbed device: %s (%s)", dev.name, path)
+            except (OSError, PermissionError) as e:
+                log.warning("Cannot grab %s: %s", path, e)
+
+        if not devices:
+            self._result_q.put(False)
+            dpy.close()
+            return
+
+        # Create virtual keyboard for forwarding non-mapped keys
+        try:
+            # Copy capabilities from first real keyboard
+            caps = devices[0].capabilities(absinfo=False)
+            # Remove EV_SYN (0) — UInput adds it automatically
+            caps.pop(ecodes.EV_SYN, None)
+            uinput = UInput(caps, name="ReKey Virtual Keyboard")
+        except Exception:
+            log.exception("Cannot create UInput device")
+            for dev in devices:
+                try:
+                    dev.ungrab()
+                except Exception:
+                    pass
+            self._result_q.put(False)
+            dpy.close()
+            return
+
+        log.info("X11KeyHook started (evdev + XTEST)")
+        self._result_q.put(True)
+
+        # Event loop
+        selector_map = {dev.fd: dev for dev in devices}
+        import select
+
+        while self._running:
+            # Process simulation commands
+            self._drain_commands(dpy)
+
+            # Wait for events with a short timeout
+            try:
+                readable, _, _ = select.select(
+                    list(selector_map.keys()), [], [], 0.02
+                )
+            except (ValueError, OSError):
+                break
+
+            for fd in readable:
+                dev = selector_map.get(fd)
+                if dev is None:
+                    continue
+                try:
+                    for event in dev.read():
+                        self._handle_evdev_event(event, uinput, dpy)
+                except (OSError, IOError):
+                    log.warning("Lost device: %s", dev.name)
+                    selector_map.pop(fd, None)
+
+        # Cleanup
+        try:
+            uinput.close()
+        except Exception:
+            pass
+        for dev in devices:
+            try:
+                dev.ungrab()
+                dev.close()
+            except Exception:
+                pass
+        try:
+            dpy.close()
+        except Exception:
+            pass
+        log.debug("Event thread exited")
+
+    def _handle_evdev_event(self, event, uinput, dpy):
+        """Process a single evdev event."""
+        if event.type != ecodes.EV_KEY:
+            # Forward non-key events (SYN, etc.) transparently
+            uinput.write_event(event)
+            uinput.syn()
+            return
+
+        key_event = categorize(event)
+        ev_keycode = event.code
+
+        # Is this key grabbed?
+        if ev_keycode in self._grabbed:
+            # Only fire on key-down (not repeat or release)
+            if key_event.keystate == key_event.key_down:
+                self._key_event.emit(ev_keycode, 0)
+            # Suppress: don't forward to uinput
+            return
+
+        # Not grabbed — forward transparently
+        uinput.write_event(event)
+        uinput.syn()
+
+    def _drain_commands(self, dpy):
+        """Process pending simulation commands."""
+        while not self._cmd_q.empty():
+            try:
+                cmd = self._cmd_q.get_nowait()
+            except queue.Empty:
+                break
+            if cmd[0] == 'simulate':
+                self._do_simulate(dpy, cmd[1], cmd[2])
+
+    def _do_simulate(self, dpy, keysym, modifiers):
+        """Simulate a key press+release via XTEST."""
+        keycode, extra_mods = self._resolve_keysym(dpy, keysym)
         if keycode is None or keycode == 0:
             return
 
-        combined_mods = modifiers | extra_mods
-        mod_keycodes = self._modifier_keycodes(combined_mods)
+        combined = modifiers | extra_mods
+        mod_kcs = self._modifier_keycodes(dpy, combined)
 
-        # Press modifiers
-        for mc in mod_keycodes:
-            xtest.fake_input(self._display, X.KeyPress, mc)
+        for mc in mod_kcs:
+            xtest.fake_input(dpy, X.KeyPress, mc)
+        xtest.fake_input(dpy, X.KeyPress, keycode)
+        xtest.fake_input(dpy, X.KeyRelease, keycode)
+        for mc in reversed(mod_kcs):
+            xtest.fake_input(dpy, X.KeyRelease, mc)
+        dpy.sync()
 
-        # Press and release the main key
-        xtest.fake_input(self._display, X.KeyPress, keycode)
-        xtest.fake_input(self._display, X.KeyRelease, keycode)
-
-        # Release modifiers (reverse order)
-        for mc in reversed(mod_keycodes):
-            xtest.fake_input(self._display, X.KeyRelease, mc)
-
-        self._display.sync()
-
-    def _resolve_keysym(self, keysym):
-        """Find the keycode and modifier mask needed to produce a keysym.
-
-        Scans the keyboard mapping table. Index 0 = no modifier,
-        index 1 = Shift. Returns (keycode, modifier_mask) or (None, 0).
-        """
-        min_kc = self._display.display.info.min_keycode
-        max_kc = self._display.display.info.max_keycode
-        count = max_kc - min_kc + 1
-
-        mapping = self._display.get_keyboard_mapping(min_kc, count)
-
+    @staticmethod
+    def _resolve_keysym(dpy, keysym):
+        """Find X11 keycode + modifier for a keysym."""
+        min_kc = dpy.display.info.min_keycode
+        max_kc = dpy.display.info.max_keycode
+        mapping = dpy.get_keyboard_mapping(min_kc, max_kc - min_kc + 1)
         for i, keysyms in enumerate(mapping):
-            for index, ks in enumerate(keysyms):
-                if ks == keysym:
-                    mods = 0
-                    if index == 1:
-                        mods = X.ShiftMask
-                    if index <= 1:
-                        return min_kc + i, mods
+            for idx, ks in enumerate(keysyms):
+                if ks == keysym and idx <= 1:
+                    return min_kc + i, X.ShiftMask if idx == 1 else 0
+        kc = dpy.keysym_to_keycode(keysym)
+        return (kc, 0) if kc != 0 else (None, 0)
 
-        # Fallback
-        kc = self._display.keysym_to_keycode(keysym)
-        if kc != 0:
-            return kc, 0
-        return None, 0
+    @staticmethod
+    def _modifier_keycodes(dpy, modifiers):
+        kcs = []
+        for bit, ksym in [(0, XK.XK_Shift_L), (2, XK.XK_Control_L),
+                           (3, XK.XK_Alt_L), (6, XK.XK_Super_L)]:
+            if modifiers & (1 << bit):
+                kc = dpy.keysym_to_keycode(ksym)
+                if kc:
+                    kcs.append(kc)
+        return kcs
 
-    def _modifier_keycodes(self, modifiers):
-        """Return list of keycodes for modifier bits that need press/release."""
-        keycodes = []
-        mod_keysyms = []
-        if modifiers & (1 << 0):  # ShiftMask
-            mod_keysyms.append(XK.XK_Shift_L)
-        if modifiers & (1 << 2):  # ControlMask
-            mod_keysyms.append(XK.XK_Control_L)
-        if modifiers & (1 << 3):  # Mod1Mask (Alt)
-            mod_keysyms.append(XK.XK_Alt_L)
-        if modifiers & (1 << 6):  # Mod4Mask (Super)
-            mod_keysyms.append(XK.XK_Super_L)
-        for ks in mod_keysyms:
-            kc = self._display.keysym_to_keycode(ks)
-            if kc:
-                keycodes.append(kc)
-        return keycodes
+    # ── main-thread signal handler ───────────────────────────────
 
-    def _event_loop(self):
-        """Background thread: blocking read of X events, dispatch via signal."""
-        log.debug("Event thread started")
-        while self._running:
-            try:
-                evt = self._evt_display.next_event()
-            except Exception:
-                if self._running:
-                    log.exception("Error reading X event")
-                break
-            if evt.type == X.KeyPress:
-                keycode = evt.detail
-                clean_mods = evt.state & ~(_LOCK_MASK | _NUM_LOCK_MASK)
-                # Emit signal to main thread
-                self._key_event.emit(keycode, clean_mods)
-        log.debug("Event thread exited")
-
-    def _on_key_event(self, keycode, clean_mods):
-        """Main thread handler: look up callback and invoke it."""
-        key = (keycode, clean_mods)
-        callback = self._grabbed.get(key)
+    def _on_key_event(self, ev_keycode, mods):
+        """Main thread: look up callback and invoke it."""
+        callback = self._grabbed.get(ev_keycode)
         if callback:
-            keysym = self._display.keycode_to_keysym(keycode, 0)
-            log.debug("Invoking callback for keycode=%d keysym=0x%x", keycode, keysym)
+            keysym = self._evdev_to_keysym.get(ev_keycode, 0)
+            log.debug("Key callback: evdev=%d keysym=0x%x", ev_keycode, keysym)
             try:
-                callback(keysym, clean_mods)
+                callback(ev_keycode, mods)
             except Exception:
                 log.exception("Error in key callback")
